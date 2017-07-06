@@ -1,0 +1,8 @@
+[package]
+name = "windowed_bytes"
+version = "0.1.0"
+authors = ["Oliver Gould <ver@buoyant.io>"]
+
+[dependencies]
+bytes = "0.4"
+futures = "0.1"
