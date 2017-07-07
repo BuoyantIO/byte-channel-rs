@@ -4,12 +4,16 @@ use std::collections::VecDeque;
 use std::cmp;
 use std::sync::{Arc, Mutex, Weak};
 
-/// Buffers
-///
-///
-pub fn new(init_capacity: usize) -> (ByteSender, ByteReceiver) {
+// XXX
+// - should capacity reclamation be tied into Chunk?  It seems "correct" for capacity to
+//   be reclaimed as the returned buffer is consumed.  But this might be overkill if the
+//   consumer ensures it can act on the data immediately (i.e. by providing a size to
+//   poll_chunk).
+
+/// Buffers up to `capacity` bytes between a `ByteSender` and `ByteReceiver`.
+pub fn new(capacity: usize) -> (ByteSender, ByteReceiver) {
     let state = Arc::new(Mutex::new(Some(State::Buffering {
-        capacity: init_capacity,
+        capacity,
         len: 0,
         buffers: VecDeque::new(),
         rx_blocked: None,
@@ -21,23 +25,8 @@ pub fn new(init_capacity: usize) -> (ByteSender, ByteReceiver) {
     (tx, rx)
 }
 
-
-#[derive(Copy, Clone, Debug)]
-pub struct Closed;
-
-pub type AsyncChunk = Async<Option<Chunk>>;
-
-
-#[derive(Debug)]
-struct TxBlocked {
-    requested: usize,
-    task: task::Task,
-}
-
-#[derive(Debug)]
-struct RxBlocked {
-    task: task::Task,
-}
+// XXX big hairy mutex around the internal state.
+type Shared = Arc<Mutex<Option<State>>>;
 
 /// The shared state of the byte channel.
 #[derive(Debug)]
@@ -88,13 +77,27 @@ impl State {
     }
 }
 
-type Shared = Arc<Mutex<Option<State>>>;
+#[derive(Copy, Clone, Debug)]
+pub struct LostPeer;
 
-fn ensure_peer(shared: &Shared, state: &mut Option<State>) -> Result<(), Closed> {
+pub type AsyncChunk = Async<Option<Chunk>>;
+
+#[derive(Debug)]
+struct TxBlocked {
+    requested: usize,
+    task: task::Task,
+}
+
+#[derive(Debug)]
+struct RxBlocked {
+    task: task::Task,
+}
+
+/// Clears out the internal state of `sharded` if the peer has been lost.
+fn ensure_peer(shared: &Shared, state: &mut Option<State>) -> Result<(), LostPeer> {
     if Arc::strong_count(shared) == 1 {
-        // lost receiver
         *state = None;
-        return Err(Closed);
+        return Err(LostPeer);
     }
     Ok(())
 }
@@ -119,15 +122,20 @@ impl ByteSender {
 
     /// Signals that no further data will be provided.  The `ByteReceiver` may continue to
     /// read from this channel until it is empty.
-    pub fn close(&mut self) {
+    pub fn close(mut self) {
+        self.do_close();
+    }
+
+    fn do_close(&mut self) {
         let mut state = self.0.lock().expect("locking byte channel");
 
         // If there's no receiver, clear the internal state.
-        if let Err(Closed) = ensure_peer(&self.0, &mut state) {
+        if let Err(LostPeer) = ensure_peer(&self.0, &mut state) {
             *state = None;
             return;
         }
 
+        // If there is another receiver,
         match state.take() {
             None => {}
 
@@ -151,19 +159,26 @@ impl ByteSender {
         }
     }
 
-    pub fn poll_capacity(&mut self, sz: usize) -> Poll<usize, Closed> {
+    /// Polls the channel to determine if `sz` bytes may be pushed.
+    ///
+    /// XXX this can't actually take a 'sz'.
+    /// TODO This needs to be `poll_window_update(&mut self) -> Poll<usize, LostPeer>`
+    pub fn poll_capacity(&mut self, sz: usize) -> Poll<(), LostPeer> {
         let mut state = self.0.lock().expect("locking byte channel");
         ensure_peer(&self.0, &mut state)?;
         match *state {
             None |
-            Some(State::Draining { .. }) => Err(Closed),
+            Some(State::Draining { .. }) => {
+                unreachable!();
+            }
+
             Some(State::Buffering {
                      capacity,
                      ref mut tx_blocked,
                      ..
                  }) => {
                 if capacity >= sz {
-                    Ok(Async::Ready(capacity))
+                    Ok(Async::Ready(()))
                 } else {
                     *tx_blocked = Some(TxBlocked {
                         requested: sz,
@@ -175,35 +190,43 @@ impl ByteSender {
         }
     }
 
-    /// Pushes bytes onto
-    pub fn push(&mut self, bytes: Bytes) {
+    /// Pushes bytes into the channel.
+    ///
+    /// ## Panics
+    ///
+    /// If called in a state when poll_capacity() will not returned a size greater than
+    /// `bytes.len()`.
+    pub fn push_bytes(&mut self, bytes: Bytes) -> Result<(), LostPeer> {
         let mut state = self.0.lock().expect("locking byte channel");
-        ensure_peer(&self.0, &mut state).expect("byte receiver alive");
-        match *state {
-            None |
-            Some(State::Draining { .. }) => {}
+        ensure_peer(&self.0, &mut state)?;
 
-            Some(State::Buffering {
-                     ref mut capacity,
-                     ref mut len,
-                     ref mut rx_blocked,
-                     ref mut buffers,
-                     ..
-                 }) => {
-                let sz = bytes.len();
-                if sz <= *capacity {
-                    buffers.push_back(bytes);
-                    *capacity -= sz;
-                    *len += sz;
-                    if let Some(rx) = rx_blocked.take() {
-                        rx.task.notify();
-                    }
-                    return;
+        if let Some(State::Buffering {
+                        ref mut capacity,
+                        ref mut len,
+                        ref mut rx_blocked,
+                        ref mut buffers,
+                        ..
+                    }) = *state
+        {
+            let sz = bytes.len();
+            if sz <= *capacity {
+                buffers.push_back(bytes);
+                *capacity -= sz;
+                *len += sz;
+                if let Some(rx) = rx_blocked.take() {
+                    rx.task.notify();
                 }
+                return Ok(());
             }
         }
 
-        panic!("ByteSender::push called in illegal state")
+        panic!("ByteSender::push called in illegal state: {:?}", *state);
+    }
+}
+
+impl Drop for ByteSender {
+    fn drop(&mut self) {
+        self.do_close();
     }
 }
 
@@ -233,7 +256,7 @@ impl ByteReceiver {
                 if len == 0 {
                     // If the buffer is empty and the sender has detached, there's no
                     // chance of
-                    if let Err(Closed) = ensure_peer(&self.0, &mut state) {
+                    if let Err(LostPeer) = ensure_peer(&self.0, &mut state) {
                         return Async::Ready(None);
                     }
 
@@ -378,6 +401,7 @@ impl Chunk {
         }
     }
 
+    /// XXX this is probably a bit too heavyweight to do on every Buf::advance()?
     fn add_capacity(ch: &Weak<Mutex<Option<State>>>, sz: usize) {
         if let Some(ch) = ch.upgrade() {
             if let Some(ch) = ch.lock().expect("locking channel").as_mut() {
