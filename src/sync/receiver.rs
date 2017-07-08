@@ -18,6 +18,12 @@ pub struct ByteReceiver<E> {
     window: SharedWindow,
 }
 
+impl<E> ByteReceiver<E> {
+    pub fn shrink_window(&self, sz: usize) {
+        (*self.window.lock().expect("locking byte channel window")).shrink(sz);
+    }
+}
+
 impl<E> Drop for ByteReceiver<E> {
     fn drop(&mut self) {
         if let Ok(mut buffer) = self.buffer.lock() {
@@ -35,7 +41,7 @@ impl<E> ByteReceiver<E> {
     /// Poll at most `max_sz` bytes from the channel.
     pub fn poll_chunk(&mut self, max_sz: usize) -> PollChunk<E> {
         if max_sz == 0 {
-            return Ok(Async::Ready(Some(chunk::empty(&self.window))));
+            return Ok(Async::Ready(Some(chunk::empty())));
         }
 
         let chunk = {

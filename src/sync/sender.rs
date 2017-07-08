@@ -17,10 +17,7 @@ pub struct ByteSender<E> {
 
 impl<E> ByteSender<E> {
     pub fn available_window(&self) -> usize {
-        (*self.window.lock().expect("locking byte channel window"))
-            .as_ref()
-            .map(|s| s.available())
-            .unwrap_or(0)
+        (*self.window.lock().expect("locking byte channel window")).advertised()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -102,19 +99,15 @@ impl<E> ByteSender<E> {
         {
             let sz = bytes.len();
 
-            match *self.window.lock().expect("locking byte channel window") {
-                None => panic!("byte channel missing window"),
-                Some(ref mut window) => {
-                    if sz <= window.available() {
-                        *len += sz;
-                        window.decrement(sz);
-                        buffers.push_back(bytes);
-                        if let Some(t) = awaiting_chunk.take() {
-                            t.notify();
-                        }
-                        return Ok(());
-                    }
+            let mut window = self.window.lock().expect("locking byte channel window");
+            if sz <= (*window).advertised() {
+                *len += sz;
+                (*window).claim_advertised(sz);
+                buffers.push_back(bytes);
+                if let Some(t) = awaiting_chunk.take() {
+                    t.notify();
                 }
+                return Ok(());
             }
 
             panic!("byte channel overflow");

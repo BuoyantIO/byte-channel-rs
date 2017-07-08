@@ -3,28 +3,28 @@ use futures::*;
 /// Tracks window sizes.
 #[derive(Debug)]
 pub struct Window {
-    available: usize,
+    pending_increment: usize,
+    advertised: usize,
     underflow: usize,
-    pending: usize,
     blocked: Option<task::Task>,
 }
 
 impl Window {
-    pub fn new(pending: usize) -> Window {
+    pub fn new(pending_increment: usize) -> Window {
         Window {
-            pending,
-            available: 0,
+            pending_increment,
+            advertised: 0,
             underflow: 0,
             blocked: None,
         }
     }
 
-    pub fn available(&self) -> usize {
-        self.available
+    pub fn advertised(&self) -> usize {
+        self.advertised
     }
 
     /// Saves a window increment to be applied when `poll_increment` is called.
-    pub fn push_increment(&mut self, incr: usize) {
+    pub fn advertise_increment(&mut self, incr: usize) {
         if incr == 0 {
             return;
         }
@@ -40,7 +40,7 @@ impl Window {
         // applied by `poll_increment`.
         let incr = incr - self.underflow;
         self.underflow = 0;
-        self.pending += incr;
+        self.pending_increment += incr;
         debug_assert!(0 < incr);
 
         // TODO be more discrening about notifaction.  (Ensure some ratio between
@@ -67,66 +67,110 @@ impl Window {
     /// If a non-zero increment is pending, apply it to the window and return the amount
     /// of available space added.
     fn apply_increment(&mut self) -> Option<usize> {
-        if self.pending == 0 {
+        if self.pending_increment == 0 {
             return None;
         }
 
-        let incr = self.pending;
-        self.pending = 0;
+        let incr = self.pending_increment;
+        self.pending_increment = 0;
 
         if self.underflow < incr {
             let incr = incr - self.underflow;
             debug_assert!(0 < incr);
+            self.advertised += incr;
             self.underflow = 0;
-            self.available += incr;
             return Some(incr);
         }
 
-        debug_assert_eq!(self.available, 0);
+        debug_assert_eq!(self.advertised, 0);
         self.underflow -= incr;
         None
     }
 
     /// Consumes capacity from the window.
     ///
-    /// The window may underflow. When this occurs, poll_increment will not return updates
-    /// until increments have been pushed that restore a positive window size.
-    pub fn decrement(&mut self, mut decr: usize) {
+    /// ## Panics
+    ///
+    /// This function panics when more bytes are claimed than have been advertised by
+    /// `poll_interval`.
+    pub fn claim_advertised(&mut self, decr: usize) {
         if decr == 0 {
             return;
         }
 
-        // Decrement from pending before looking at available updates.
-        if decr <= self.pending {
-            self.pending -= decr;
-            return;
-        }
-        decr -= self.pending;
-        self.pending = 0;
-
         // If there's enough available space, take from that.
-        if decr <= self.available {
-            debug_assert_eq!(self.underflow, 0);
-            self.available -= decr;
-            return;
+        if self.advertised < decr {
+            panic!("illegal window underflow");
         }
+        self.advertised -= decr;
+    }
 
-        // Otherwise, we have to go into overflow.
-        self.underflow += decr - self.available;
-        self.available = 0;
+    /// Eventually removes capacity from the window.
+    ///
+    /// Once all advertised capacity has been claimed, new increments will not add
+    /// capacity until they have compensated for any underflow incurred by shrinking the
+    /// window.
+    ///
+    /// ## Panics
+    ///
+    /// This function panics when more bytes are claimed than have been advertised by
+    /// `poll_interval`.
+    pub fn shrink(&mut self, decr: usize) {
+        self.underflow += decr;
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use futures::{self, Async, Poll, Future, Stream};
+    use futures::{Async, Poll, Stream};
     use futures::executor::{self, Notify, NotifyHandle};
     use std::cell::RefCell;
+    use std::fmt;
     use std::rc::Rc;
+    use std::sync::Arc;
+
+    // TODO test that the task is notified on state change.
+
+    #[test]
+    fn poll_applies_increment() {
+        let win = Rc::new(RefCell::new(Window::new(0)));
+        let mut wstream = WindowStream(win.clone());
+        assert_eq!(win.borrow().advertised(), 0);
+
+        sassert_empty(&mut wstream);
+        win.borrow_mut().advertise_increment(8);
+        assert_eq!(win.borrow().advertised(), 0);
+
+        sassert_next(&mut wstream, 8);
+        assert_eq!(win.borrow().advertised(), 8);
+    }
+
+    #[test]
+    fn poll_not_ready_when_underflow() {
+        let win = Rc::new(RefCell::new(Window::new(8)));
+        let mut wstream = WindowStream(win.clone());
+
+        assert_eq!(win.borrow().advertised(), 0);
+        sassert_next(&mut wstream, 8);
+        assert_eq!(win.borrow().advertised(), 8);
+
+        win.borrow_mut().shrink(8);
+        sassert_empty(&mut wstream);
+        assert_eq!(win.borrow().advertised(), 8);
+
+        win.borrow_mut().claim_advertised(7);
+        sassert_empty(&mut wstream);
+        assert_eq!(win.borrow().advertised(), 1);
+
+        win.borrow_mut().advertise_increment(9);
+        assert_eq!(win.borrow().advertised(), 1);
+        sassert_next(&mut wstream, 1);
+        assert_eq!(win.borrow().advertised(), 2);
+    }
 
     // from futures-rs.
-    pub fn notify_noop() -> NotifyHandle {
+    fn notify_noop() -> NotifyHandle {
         struct Noop;
         impl Notify for Noop {
             fn notify(&self, _id: usize) {}
@@ -134,6 +178,53 @@ mod test {
         const NOOP: &'static Noop = &Noop;
         NotifyHandle::from(NOOP)
     }
+    fn notify_panic() -> NotifyHandle {
+        struct Panic;
+        impl Notify for Panic {
+            fn notify(&self, _id: usize) {
+                panic!("should not be notified");
+            }
+        }
+        NotifyHandle::from(Arc::new(Panic))
+    }
+    // fn sassert_done<S: Stream>(s: &mut S) {
+    //     match executor::spawn(s).poll_stream_notify(&notify_panic(), 0) {
+    //         Ok(Async::Ready(None)) => {}
+    //         Ok(Async::Ready(Some(_))) => panic!("stream had more elements"),
+    //         Ok(Async::NotReady) => panic!("stream wasn't ready"),
+    //         Err(_) => panic!("stream had an error"),
+    //     }
+    // }
+    fn sassert_empty<S: Stream>(s: &mut S) {
+        match executor::spawn(s).poll_stream_notify(&notify_noop(), 0) {
+            Ok(Async::Ready(None)) => panic!("stream is at its end"),
+            Ok(Async::Ready(Some(_))) => panic!("stream had more elements"),
+            Ok(Async::NotReady) => {}
+            Err(_) => panic!("stream had an error"),
+        }
+    }
+    fn sassert_next<S: Stream>(s: &mut S, item: S::Item)
+    where
+        S::Item: Eq + fmt::Debug,
+    {
+        match executor::spawn(s).poll_stream_notify(&notify_panic(), 0) {
+            Ok(Async::Ready(None)) => panic!("stream is at its end"),
+            Ok(Async::Ready(Some(e))) => assert_eq!(e, item),
+            Ok(Async::NotReady) => panic!("stream wasn't ready"),
+            Err(_) => panic!("stream had an error"),
+        }
+    }
+    // fn sassert_err<S: Stream>(s: &mut S, err: S::Error)
+    // where
+    //     S::Error: Eq + fmt::Debug,
+    // {
+    //     match executor::spawn(s).poll_stream_notify(&notify_panic(), 0) {
+    //         Ok(Async::Ready(None)) => panic!("stream is at its end"),
+    //         Ok(Async::Ready(Some(_))) => panic!("stream had more elements"),
+    //         Ok(Async::NotReady) => panic!("stream wasn't ready"),
+    //         Err(e) => assert_eq!(e, err),
+    //     }
+    // }
 
     struct WindowStream(Rc<RefCell<Window>>);
     impl Stream for WindowStream {
@@ -144,73 +235,5 @@ mod test {
             let sz = try_ready!(win.poll_increment());
             Ok(Async::Ready(Some(sz)))
         }
-    }
-
-    #[test]
-    fn poll_applies_increment() {
-        let win = Rc::new(RefCell::new(Window::new(0)));
-
-        let mut task = {
-            let win = win.clone();
-            executor::spawn(futures::lazy(move || {
-                let w = WindowStream(win);
-                w.into_future().map(|(up, _)| up).map_err(|_| {})
-            }))
-        };
-
-        assert!(
-            task.poll_future_notify(&notify_noop(), 0)
-                .unwrap()
-                .is_not_ready()
-        );
-        assert_eq!(win.borrow().available(), 0);
-
-        win.borrow_mut().push_increment(8);
-        assert_eq!(win.borrow().available(), 0);
-
-        // TODO test that the task is notified on state change.
-        assert_eq!(
-            task.poll_future_notify(&notify_noop(), 0).unwrap(),
-            Async::Ready(Some(8))
-        );
-        assert_eq!(win.borrow().available(), 8);
-    }
-
-    #[test]
-    fn poll_not_ready_when_underflow() {
-        let win = Rc::new(RefCell::new(Window::new(0)));
-
-        let mut task = {
-            let win = win.clone();
-            executor::spawn(futures::lazy(move || {
-                let w = WindowStream(win);
-                w.into_future().map(|(up, _)| up).map_err(|_| {})
-            }))
-        };
-
-        win.borrow_mut().decrement(8);
-        assert_eq!(win.borrow().available(), 0);
-        assert!(
-            task.poll_future_notify(&notify_noop(), 0)
-                .unwrap()
-                .is_not_ready()
-        );
-
-        win.borrow_mut().push_increment(8);
-        assert_eq!(win.borrow().available(), 0);
-        assert!(
-            task.poll_future_notify(&notify_noop(), 0)
-                .unwrap()
-                .is_not_ready()
-        );
-
-        // TODO test that the task is notified on state change.
-        win.borrow_mut().push_increment(8);
-        assert_eq!(win.borrow().available(), 0);
-        assert_eq!(
-            task.poll_future_notify(&notify_noop(), 0).unwrap(),
-            Async::Ready(Some(8))
-        );
-        assert_eq!(win.borrow().available(), 8);
     }
 }

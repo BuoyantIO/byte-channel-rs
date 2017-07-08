@@ -4,47 +4,48 @@ use std::sync::Arc;
 
 use super::{SharedWindow, WeakWindow};
 
-pub fn empty(w: &SharedWindow) -> Chunk {
+pub fn empty() -> Chunk {
     Chunk {
         bytes: ChunkBytes::Zero,
-        window: Arc::downgrade(w),
+        window: None,
     }
 }
 
 pub fn from_bytes(w: &SharedWindow, bytes: Bytes) -> Chunk {
     if bytes.is_empty() {
-        return empty(w);
+        return empty();
     }
 
     Chunk {
         bytes: ChunkBytes::One(bytes),
-        window: Arc::downgrade(w),
+        window: Some(Arc::downgrade(w)),
     }
 }
 
 pub fn from_vec(w: &SharedWindow, mut buffers: VecDeque<Bytes>) -> Chunk {
     let sz = buffers.len();
     if sz == 0 {
-        return empty(w);
+        return empty();
     } else if sz == 1 {
         return from_bytes(w, buffers.pop_front().unwrap());
     }
 
     let remaining = buffers.iter().fold(0, |sz, b| sz + b.len());
     if remaining == 0 {
-        return empty(w);
+        return empty();
     }
 
     Chunk {
         bytes: ChunkBytes::Many { remaining, buffers },
-        window: Arc::downgrade(w),
+        window: Some(Arc::downgrade(w)),
     }
 }
 
+/// Stores an immutable byte sequence.  As the sequence is consumed, the window is opened.
 #[derive(Debug)]
 pub struct Chunk {
     bytes: ChunkBytes,
-    window: WeakWindow,
+    window: Option<WeakWindow>,
 }
 
 impl Chunk {
@@ -61,10 +62,8 @@ impl Chunk {
             return;
         }
         // XXX this is probably a bit too heavyweight to do on every Buf::advance()?
-        if let Some(wmut) = wref.upgrade() {
-            if let Some(window) = wmut.lock().expect("locking window").as_mut() {
-                window.push_increment(sz);
-            }
+        if let Some(ref wmut) = wref.upgrade() {
+            wmut.lock().expect("locking window").advertise_increment(sz);
         }
     }
 }
@@ -81,8 +80,11 @@ enum ChunkBytes {
 }
 
 impl Drop for Chunk {
+    /// When a chunk is dropped, all of its bytes are returned to the underlying window.
     fn drop(&mut self) {
-        Self::add_capacity(&self.window, self.len());
+        if let Some(win) = self.window.take() {
+            Self::add_capacity(&win, self.len());
+        }
         self.bytes = ChunkBytes::Zero;
     }
 }
@@ -116,8 +118,9 @@ impl Buf for Chunk {
 
         match self.bytes {
             ChunkBytes::Zero => {
-                return;
+                panic!("advance exceeds chunk size");
             }
+
             ChunkBytes::One(ref mut bytes) => {
                 let len = bytes.len();
                 if len < sz {
@@ -127,7 +130,9 @@ impl Buf for Chunk {
                 } else {
                     drop(bytes.split_to(sz))
                 };
-                Self::add_capacity(&self.window, sz);
+                if let Some(ref win) = self.window.as_ref() {
+                    Self::add_capacity(win, sz);
+                }
                 return;
             }
 
@@ -149,8 +154,11 @@ impl Buf for Chunk {
                         drop(bytes);
                         buffers.push_front(rest);
 
+                        // Commit the change
                         *remaining -= orig_sz;
-                        Self::add_capacity(&self.window, orig_sz);
+                        if let Some(ref win) = self.window.as_ref() {
+                            Self::add_capacity(win, orig_sz);
+                        }
                         return;
                     }
 
@@ -159,13 +167,14 @@ impl Buf for Chunk {
                     sz -= len;
                     if sz == 0 {
                         *remaining -= orig_sz;
-                        Self::add_capacity(&self.window, orig_sz);
+                        if let Some(ref win) = self.window.as_ref() {
+                            Self::add_capacity(win, orig_sz);
+                        }
                         return;
                     }
                 }
+                panic!("advance exceeds chunk size");
             }
         }
-
-        panic!("advance exceeds chunk size");
     }
 }
