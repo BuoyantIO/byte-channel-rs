@@ -94,6 +94,8 @@ fn e2e() {
     sassert_empty(&mut wx);
 
     drop(tx);
+    sassert_done(&mut rx);
+
     drop(rx);
     sassert_done(&mut wx);
 }
