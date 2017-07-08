@@ -26,7 +26,7 @@ impl Stream for Reader {
 #[test]
 fn e2e() {
     let (mut wx, mut tx, rx) = sync::new::<()>(10);
-    let mut rx = Reader(rx, 3);
+    let mut rx = Reader(rx, 0);
 
     assert_eq!(tx.available_window(), 0);
     sassert_next(&mut wx, 10);
@@ -35,13 +35,70 @@ fn e2e() {
     tx.push_bytes(Bytes::from("0123456789")).unwrap();
     sassert_empty(&mut wx);
 
+    for sz in &[4 as usize, 3, 2, 1] {
+        let sz = *sz;
+        rx = rx.resize(sz);
+        match executor::spawn(&mut rx).poll_stream_notify(&notify_panic(), 0) {
+            Ok(Async::Ready(Some(chunk))) => {
+                sassert_empty(&mut wx);
+                assert_eq!(chunk.remaining(), sz);
+                drop(chunk);
+            }
+            res => panic!("stream error: {:?}", res),
+        }
+        assert_eq!(tx.available_window(), 0);
+
+        sassert_next(&mut wx, sz);
+        assert_eq!(tx.available_window(), sz);
+
+        tx.push_bytes(Bytes::from(vec![0; sz])).unwrap();
+        assert_eq!(tx.available_window(), 0);
+    }
+    sassert_empty(&mut wx);
+
+    rx = rx.resize(8);
+    match executor::spawn(&mut rx).poll_stream_notify(&notify_panic(), 0) {
+        Ok(Async::Ready(Some(mut chunk))) => {
+            assert_eq!(chunk.remaining(), 8);
+            sassert_empty(&mut wx);
+
+            chunk.advance(4);
+            assert_eq!(chunk.remaining(), 4);
+            sassert_next(&mut wx, 4);
+            assert_eq!(tx.available_window(), 4);
+
+            chunk.advance(2);
+            assert_eq!(chunk.remaining(), 2);
+            sassert_next(&mut wx, 2);
+            assert_eq!(tx.available_window(), 6);
+
+            chunk.advance(1);
+            assert_eq!(chunk.remaining(), 1);
+            sassert_next(&mut wx, 1);
+            assert_eq!(tx.available_window(), 7);
+
+            drop(chunk);
+            sassert_next(&mut wx, 1);
+            assert_eq!(tx.available_window(), 8);
+        }
+        res => panic!("stream error: {:?}", res),
+    }
+    sassert_empty(&mut wx);
+
     match executor::spawn(&mut rx).poll_stream_notify(&notify_panic(), 0) {
         Ok(Async::Ready(Some(chunk))) => {
             sassert_empty(&mut wx);
-            assert_eq!(chunk.remaining(), 3);
+            assert_eq!(chunk.remaining(), 2);
             drop(chunk);
         }
         res => panic!("stream error: {:?}", res),
     }
-    sassert_next(&mut wx, 3);
+    assert_eq!(tx.available_window(), 8);
+    sassert_next(&mut wx, 2);
+    assert_eq!(tx.available_window(), 10);
+    sassert_empty(&mut wx);
+
+    drop(tx);
+    drop(rx);
+    sassert_done(&mut wx);
 }
