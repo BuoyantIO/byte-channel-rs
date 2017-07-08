@@ -67,14 +67,9 @@ fn e2e() {
             sassert_next(&mut wx, 4);
             assert_eq!(tx.available_window(), 4);
 
-            chunk.advance(2);
-            assert_eq!(chunk.remaining(), 2);
-            sassert_next(&mut wx, 2);
-            assert_eq!(tx.available_window(), 6);
-
-            chunk.advance(1);
+            chunk.advance(3);
             assert_eq!(chunk.remaining(), 1);
-            sassert_next(&mut wx, 1);
+            sassert_next(&mut wx, 3);
             assert_eq!(tx.available_window(), 7);
 
             drop(chunk);
