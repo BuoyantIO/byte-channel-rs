@@ -1,9 +1,7 @@
 use bytes::Bytes;
 
 use super::{ChannelBuffer, SharedBuffer, SharedWindow, return_buffer_to_window};
-
-#[derive(Copy, Clone, Debug)]
-pub struct LostReceiver;
+use super::super::LostReceiver;
 
 pub fn new<E>(buffer: SharedBuffer<E>, window: SharedWindow) -> ByteSender<E> {
     ByteSender { buffer, window }
@@ -34,7 +32,7 @@ impl<E> ByteSender<E> {
             .unwrap_or(0)
     }
 
-    /// Will cause the next receiver operation to fail with the provided error.
+    /// Causes the next receiver operation to fail with the provided error.
     pub fn reset(self, e: E) {
         let mut buffer = self.buffer.lock().expect("locking byte channel buffer");
         return_buffer_to_window(&buffer, &self.window);
@@ -50,7 +48,6 @@ impl<E> ByteSender<E> {
     fn do_close(&mut self) {
         let mut buffer = self.buffer.lock().expect("locking byte channel buffer");
 
-        // If there is another receiver,
         if let Some(state) = (*buffer).take() {
             match state {
                 ChannelBuffer::Sending {
@@ -62,7 +59,7 @@ impl<E> ByteSender<E> {
                     *buffer = Some(ChannelBuffer::SenderClosed { len, buffers });
 
                     // If the receiver is waiting for data, notify it so that the channel is
-                    // closed.
+                    // fully closed.
                     if let Some(t) = awaiting_chunk.take() {
                         t.notify();
                     }
@@ -79,7 +76,9 @@ impl<E> ByteSender<E> {
     ///
     /// ## Panics
     ///
-    /// If the channel is not
+    /// Panics if `bytes` exceeds the advertised capacity of this channel.
+    ///
+    /// Panics if
     pub fn push_bytes(&mut self, bytes: Bytes) -> Result<(), LostReceiver> {
         let mut buffer = self.buffer.lock().expect("locking byte channel buffer");
 

@@ -123,12 +123,10 @@ impl Window {
 #[cfg(test)]
 mod test {
     use super::*;
+    use super::super::test::*;
     use futures::{Async, Poll, Stream};
-    use futures::executor::{self, Notify, NotifyHandle};
     use std::cell::RefCell;
-    use std::fmt;
     use std::rc::Rc;
-    use std::sync::Arc;
 
     // TODO test that the task is notified on state change.
 
@@ -155,7 +153,7 @@ mod test {
         sassert_next(&mut wstream, 8);
         assert_eq!(win.borrow().advertised(), 8);
 
-        win.borrow_mut().shrink(8);
+        win.borrow_mut().shrink(4);
         sassert_empty(&mut wstream);
         assert_eq!(win.borrow().advertised(), 8);
 
@@ -163,72 +161,14 @@ mod test {
         sassert_empty(&mut wstream);
         assert_eq!(win.borrow().advertised(), 1);
 
-        win.borrow_mut().advertise_increment(7);
+        win.borrow_mut().advertise_increment(3);
         sassert_empty(&mut wstream);
         assert_eq!(win.borrow().advertised(), 1);
 
-        win.borrow_mut().advertise_increment(2);
-        assert_eq!(win.borrow().advertised(), 1);
-        sassert_next(&mut wstream, 1);
-        assert_eq!(win.borrow().advertised(), 2);
+        win.borrow_mut().advertise_increment(4);
+        sassert_next(&mut wstream, 3);
+        assert_eq!(win.borrow().advertised(), 4);
     }
-
-    // from futures-rs.
-    fn notify_noop() -> NotifyHandle {
-        struct Noop;
-        impl Notify for Noop {
-            fn notify(&self, _id: usize) {}
-        }
-        const NOOP: &'static Noop = &Noop;
-        NotifyHandle::from(NOOP)
-    }
-    fn notify_panic() -> NotifyHandle {
-        struct Panic;
-        impl Notify for Panic {
-            fn notify(&self, _id: usize) {
-                panic!("should not be notified");
-            }
-        }
-        NotifyHandle::from(Arc::new(Panic))
-    }
-    // fn sassert_done<S: Stream>(s: &mut S) {
-    //     match executor::spawn(s).poll_stream_notify(&notify_panic(), 0) {
-    //         Ok(Async::Ready(None)) => {}
-    //         Ok(Async::Ready(Some(_))) => panic!("stream had more elements"),
-    //         Ok(Async::NotReady) => panic!("stream wasn't ready"),
-    //         Err(_) => panic!("stream had an error"),
-    //     }
-    // }
-    fn sassert_empty<S: Stream>(s: &mut S) {
-        match executor::spawn(s).poll_stream_notify(&notify_noop(), 0) {
-            Ok(Async::Ready(None)) => panic!("stream is at its end"),
-            Ok(Async::Ready(Some(_))) => panic!("stream had more elements"),
-            Ok(Async::NotReady) => {}
-            Err(_) => panic!("stream had an error"),
-        }
-    }
-    fn sassert_next<S: Stream>(s: &mut S, item: S::Item)
-    where
-        S::Item: Eq + fmt::Debug,
-    {
-        match executor::spawn(s).poll_stream_notify(&notify_panic(), 0) {
-            Ok(Async::Ready(None)) => panic!("stream is at its end"),
-            Ok(Async::Ready(Some(e))) => assert_eq!(e, item),
-            Ok(Async::NotReady) => panic!("stream wasn't ready"),
-            Err(_) => panic!("stream had an error"),
-        }
-    }
-    // fn sassert_err<S: Stream>(s: &mut S, err: S::Error)
-    // where
-    //     S::Error: Eq + fmt::Debug,
-    // {
-    //     match executor::spawn(s).poll_stream_notify(&notify_panic(), 0) {
-    //         Ok(Async::Ready(None)) => panic!("stream is at its end"),
-    //         Ok(Async::Ready(Some(_))) => panic!("stream had more elements"),
-    //         Ok(Async::NotReady) => panic!("stream wasn't ready"),
-    //         Err(e) => assert_eq!(e, err),
-    //     }
-    // }
 
     struct WindowStream(Rc<RefCell<Window>>);
     impl Stream for WindowStream {
