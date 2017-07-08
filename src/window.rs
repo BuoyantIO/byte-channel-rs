@@ -163,7 +163,11 @@ mod test {
         sassert_empty(&mut wstream);
         assert_eq!(win.borrow().advertised(), 1);
 
-        win.borrow_mut().advertise_increment(9);
+        win.borrow_mut().advertise_increment(7);
+        sassert_empty(&mut wstream);
+        assert_eq!(win.borrow().advertised(), 1);
+
+        win.borrow_mut().advertise_increment(2);
         assert_eq!(win.borrow().advertised(), 1);
         sassert_next(&mut wstream, 1);
         assert_eq!(win.borrow().advertised(), 2);
