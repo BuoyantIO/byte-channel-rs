@@ -4,120 +4,94 @@ use std::collections::VecDeque;
 use std::cmp;
 use std::sync::{Arc, Mutex, Weak};
 
-// XXX
-// - should capacity reclamation be tied into Chunk?  It seems "correct" for capacity to
-//   be reclaimed as the returned buffer is consumed.  But this might be overkill if the
-//   consumer ensures it can act on the data immediately (i.e. by providing a size to
-//   poll_chunk).
+use buffer::ChannelBuffer;
+use window::Window;
 
-/// Buffers up to `capacity` bytes between a `ByteSender` and `ByteReceiver`.
-pub fn new(capacity: usize) -> (ByteSender, ByteReceiver) {
-    let state = Arc::new(Mutex::new(Some(State::Buffering {
-        capacity,
+/// Creates an asynchronous channel for transfering byte streams.
+///
+/// T
+pub fn new<E>(initial_window_size: usize) -> (ByteSender<E>, ByteReceiver<E>, WindowIncrements) {
+    let buffer = Arc::new(Mutex::new(Some(ChannelBuffer::Buffering {
         len: 0,
         buffers: VecDeque::new(),
-        rx_blocked: None,
-        tx_blocked: None,
+        awaiting_chunk: None,
     })));
 
-    let tx = ByteSender(state.clone());
-    let rx = ByteReceiver(state);
-    (tx, rx)
+    let window = Arc::new(Mutex::new(Some(Window::new(initial_window_size))));
+
+    let tx = ByteSender {
+        buffer: buffer.clone(),
+        window: window.clone(),
+    };
+    let rx = ByteReceiver {
+        buffer,
+        window: window.clone(),
+    };
+    let up = WindowIncrements(window);
+    (tx, rx, up)
 }
 
-// XXX big hairy mutex around the internal state.
-type Shared = Arc<Mutex<Option<State>>>;
+pub type PollChunk<E> = Result<Async<Option<Chunk>>, E>;
 
-/// The shared state of the byte channel.
-#[derive(Debug)]
-enum State {
-    Buffering {
-        capacity: usize,
-        len: usize,
-        buffers: VecDeque<Bytes>,
-        tx_blocked: Option<TxBlocked>,
-        rx_blocked: Option<RxBlocked>,
-    },
-
-    Draining {
-        len: usize,
-        buffers: VecDeque<Bytes>,
-    },
-}
-
-impl State {
-    fn len(&self) -> usize {
-        match *self {
-            State::Buffering { len, .. } |
-            State::Draining { len, .. } => len,
-        }
-    }
-
-    fn available(&self) -> usize {
-        match *self {
-            State::Buffering { capacity, .. } => capacity,
-            State::Draining { .. } => 0,
-        }
-    }
-
-    fn add_capacity(&mut self, sz: usize) {
-        match *self {
-            State::Draining { .. } => {}
-            State::Buffering {
-                ref mut capacity,
-                ref mut tx_blocked,
-                ..
-            } => {
-                *capacity += sz;
-                if let Some(tx) = tx_blocked.take() {
-                    tx.task.notify();
-                }
-            }
-        }
-    }
-}
+type SharedBuffer<E> = Arc<Mutex<Option<ChannelBuffer<E>>>>;
+type SharedWindow = Arc<Mutex<Option<Window>>>;
+type WeakWindow = Weak<Mutex<Option<Window>>>;
 
 #[derive(Copy, Clone, Debug)]
 pub struct LostPeer;
 
-pub type AsyncChunk = Async<Option<Chunk>>;
-
-#[derive(Debug)]
-struct TxBlocked {
-    requested: usize,
-    task: task::Task,
-}
-
-#[derive(Debug)]
-struct RxBlocked {
-    task: task::Task,
-}
-
 /// Clears out the internal state of `sharded` if the peer has been lost.
-fn ensure_peer(shared: &Shared, state: &mut Option<State>) -> Result<(), LostPeer> {
+fn ensure_peer<T>(shared: &Arc<T>) -> Result<(), LostPeer> {
     if Arc::strong_count(shared) == 1 {
-        *state = None;
         return Err(LostPeer);
     }
     Ok(())
 }
 
 #[derive(Debug)]
-pub struct ByteSender(Shared);
+pub struct ByteSender<E> {
+    buffer: SharedBuffer<E>,
+    window: SharedWindow,
+}
 
-impl ByteSender {
-    pub fn available(&self) -> usize {
-        (*self.0.lock().expect("locking byte channel"))
+impl<E> ByteSender<E> {
+    pub fn available_window(&self) -> usize {
+        (*self.window.lock().expect("locking byte channel window"))
             .as_ref()
             .map(|s| s.available())
             .unwrap_or(0)
     }
 
+    pub fn is_empty(&self) -> bool {
+        (*self.buffer.lock().expect("locking byte channel buffer"))
+            .as_ref()
+            .map(|s| s.is_empty())
+            .unwrap_or(true)
+    }
+
     pub fn len(&self) -> usize {
-        (*self.0.lock().expect("locking byte channel"))
+        (*self.buffer.lock().expect("locking byte channel buffer"))
             .as_ref()
             .map(|s| s.len())
             .unwrap_or(0)
+    }
+
+    fn return_buffer_to_window(&self, buffer: &Option<ChannelBuffer<E>>) {
+        let sz = buffer.as_ref().map(|b| b.len()).unwrap_or(0);
+        if sz == 0 {
+            return;
+        }
+        let mut window = self.window.lock().expect("locking byte channel window");
+        if let Some(ref mut w) = *window {
+            w.push_increment(sz);
+        }
+    }
+
+    /// Will cause the next receiver operation to fail with the provided error.
+    pub fn reset(self, e: E) {
+        let mut buffer = self.buffer.lock().expect("locking byte channel buffer");
+        self.return_buffer_to_window(&buffer);
+        *buffer = Some(ChannelBuffer::Failed(e));
     }
 
     /// Signals that no further data will be provided.  The `ByteReceiver` may continue to
@@ -127,65 +101,36 @@ impl ByteSender {
     }
 
     fn do_close(&mut self) {
-        let mut state = self.0.lock().expect("locking byte channel");
+        let mut buffer = self.buffer.lock().expect("locking byte channel buffer");
 
         // If there's no receiver, clear the internal state.
-        if let Err(LostPeer) = ensure_peer(&self.0, &mut state) {
-            *state = None;
+        if let Err(LostPeer) = ensure_peer(&self.buffer) {
+            self.return_buffer_to_window(&buffer);
+            *buffer = None;
             return;
         }
 
         // If there is another receiver,
-        match state.take() {
+        match (*buffer).take() {
             None => {}
 
-            Some(draining @ State::Draining { .. }) => {
-                *state = Some(draining);
-            }
-
-            Some(State::Buffering {
+            Some(ChannelBuffer::Buffering {
                      len,
                      buffers,
-                     mut rx_blocked,
+                     mut awaiting_chunk,
                      ..
                  }) => {
-                *state = Some(State::Draining { len, buffers });
-                drop(state);
-                // If the receiver is waiting for data, inform it that the jig is up.
-                if let Some(rx) = rx_blocked.take() {
-                    rx.task.notify();
+                *buffer = Some(ChannelBuffer::Draining { len, buffers });
+
+                // If the receiver is waiting for data, notify it so that the channel is
+                // closed.
+                if let Some(t) = awaiting_chunk.take() {
+                    t.notify();
                 }
             }
-        }
-    }
 
-    /// Polls the channel to determine if `sz` bytes may be pushed.
-    ///
-    /// XXX this can't actually take a 'sz'.
-    /// TODO This needs to be `poll_window_update(&mut self) -> Poll<usize, LostPeer>`
-    pub fn poll_capacity(&mut self, sz: usize) -> Poll<(), LostPeer> {
-        let mut state = self.0.lock().expect("locking byte channel");
-        ensure_peer(&self.0, &mut state)?;
-        match *state {
-            None |
-            Some(State::Draining { .. }) => {
-                unreachable!();
-            }
-
-            Some(State::Buffering {
-                     capacity,
-                     ref mut tx_blocked,
-                     ..
-                 }) => {
-                if capacity >= sz {
-                    Ok(Async::Ready(()))
-                } else {
-                    *tx_blocked = Some(TxBlocked {
-                        requested: sz,
-                        task: task::current(),
-                    });
-                    Ok(Async::NotReady)
-                }
+            Some(state) => {
+                *buffer = Some(state);
             }
         }
     }
@@ -194,154 +139,160 @@ impl ByteSender {
     ///
     /// ## Panics
     ///
-    /// If called in a state when poll_capacity() will not returned a size greater than
-    /// `bytes.len()`.
+    /// If the channel is not
     pub fn push_bytes(&mut self, bytes: Bytes) -> Result<(), LostPeer> {
-        let mut state = self.0.lock().expect("locking byte channel");
-        ensure_peer(&self.0, &mut state)?;
+        let mut buffer = self.buffer.lock().expect("locking byte channel buffer");
 
-        if let Some(State::Buffering {
-                        ref mut capacity,
-                        ref mut len,
-                        ref mut rx_blocked,
-                        ref mut buffers,
-                        ..
-                    }) = *state
-        {
-            let sz = bytes.len();
-            if sz <= *capacity {
-                buffers.push_back(bytes);
-                *capacity -= sz;
-                *len += sz;
-                if let Some(rx) = rx_blocked.take() {
-                    rx.task.notify();
-                }
-                return Ok(());
-            }
+        if let Err(lost) = ensure_peer(&self.buffer) {
+            // If there's no receiver, drop the entire buffer and error.
+            self.return_buffer_to_window(&buffer);
+            *buffer = None;
+            return Err(lost);
         }
 
-        panic!("ByteSender::push called in illegal state: {:?}", *state);
+        if let Some(ChannelBuffer::Buffering {
+                        ref mut len,
+                        ref mut awaiting_chunk,
+                        ref mut buffers,
+                        ..
+                    }) = *buffer
+        {
+            let sz = bytes.len();
+
+            match *self.window.lock().expect("locking byte channel window") {
+                None => panic!("byte channel missing window"),
+                Some(ref mut window) => {
+                    if sz <= window.available() {
+                        *len += sz;
+                        window.decrement(sz);
+                        buffers.push_back(bytes);
+                        if let Some(t) = awaiting_chunk.take() {
+                            t.notify();
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+
+            panic!("byte channel overflow");
+        }
+
+        panic!("ByteSender::push called in illegal buffer state");
     }
 }
 
-impl Drop for ByteSender {
+impl<E> Drop for ByteSender<E> {
     fn drop(&mut self) {
         self.do_close();
     }
 }
 
 #[derive(Debug)]
-pub struct ByteReceiver(Shared);
+pub struct ByteReceiver<E> {
+    buffer: Arc<Mutex<Option<ChannelBuffer<E>>>>,
+    window: Arc<Mutex<Option<Window>>>,
+}
 
-impl ByteReceiver {
-    pub fn poll_chunk(&mut self, sz: usize) -> AsyncChunk {
-        if sz == 0 {
-            return Async::Ready(Some(Chunk::empty(&self.0)));
+impl<E> ByteReceiver<E> {
+    /// Poll at most `max_sz` bytes from the channel.
+    pub fn poll_chunk(&mut self, max_sz: usize) -> PollChunk<E> {
+        if max_sz == 0 {
+            return Ok(Async::Ready(Some(Chunk::empty(&self.window))));
         }
 
-        let mut state = self.0.lock().expect("locking byte channel");
+        let chunk = {
+            let mut buffer = self.buffer.lock().expect("locking byte channel buffer");
+            match (*buffer).take() {
+                None => {
+                    return Ok(Async::Ready(None));
+                }
 
-        let chunk = match (*state).take() {
-            None => {
-                return Async::Ready(None);
-            }
+                Some(ChannelBuffer::Failed(e)) => {
+                    return Err(e);
+                }
 
-            Some(State::Buffering {
-                     capacity,
-                     mut len,
-                     mut buffers,
-                     mut tx_blocked,
-                     ..
-                 }) => {
-                if len == 0 {
-                    // If the buffer is empty and the sender has detached, there's no
-                    // chance of
-                    if let Err(LostPeer) = ensure_peer(&self.0, &mut state) {
-                        return Async::Ready(None);
+                Some(ChannelBuffer::Buffering {
+                         mut len,
+                         mut buffers,
+                         ..
+                     }) => {
+                    if len == 0 {
+                        // If the buffer is empty and the sender has detached, there's no
+                        // chance of producing anythign further.
+                        if let Err(LostPeer) = ensure_peer(&self.buffer) {
+                            *buffer = None;
+                            return Ok(Async::Ready(None));
+                        }
+
+                        // Otherwise, wiat for another chunk to be pushed.
+                        *buffer = Some(ChannelBuffer::Buffering {
+                            len,
+                            buffers,
+                            awaiting_chunk: Some(task::current()),
+                        });
+                        return Ok(Async::NotReady);
                     }
 
-                    *state = Some(State::Buffering {
-                        capacity,
+                    let sz = cmp::min(len, max_sz);
+                    debug_assert!(sz != 0);
+
+                    // Capacity will be increased as the chunk is consumed.
+                    len -= sz;
+                    let chunk = Self::assemble_chunk(&self.window, &mut buffers, sz);
+
+                    *buffer = Some(ChannelBuffer::Buffering {
                         len,
                         buffers,
-                        tx_blocked,
-                        rx_blocked: Some(RxBlocked { task: task::current() }),
+                        awaiting_chunk: None,
                     });
-                    return Async::NotReady;
+
+                    chunk
                 }
 
-                let sz = cmp::min(len, sz);
-                debug_assert!(sz != 0);
+                Some(ChannelBuffer::Draining {
+                         mut buffers,
+                         mut len,
+                     }) => {
+                    if len == 0 {
+                        *buffer = None;
+                        return Ok(Async::Ready(None));
+                    }
 
-                // Capacity will be increased as the chunk is consumed.
-                len -= sz;
-                let chunk = Self::assemble_chunk(&self.0, &mut buffers, sz);
+                    let sz = cmp::min(len, max_sz);
+                    debug_assert!(sz != 0);
+                    let chunk = Self::assemble_chunk(&self.window, &mut buffers, sz);
 
-                *state = Some(State::Buffering {
-                    capacity,
-                    len,
-                    buffers,
-                    rx_blocked: None,
-                    tx_blocked: tx_blocked.take().and_then(
-                        |tx| if tx.requested <= capacity {
-                            tx.task.notify();
+                    len -= sz;
+                    *buffer = {
+                        if len == 0 {
                             None
                         } else {
-                            Some(tx)
-                        },
-                    ),
-                });
+                            Some(ChannelBuffer::Draining { buffers, len })
+                        }
+                    };
 
-                chunk
-            }
-
-            Some(State::Draining {
-                     mut buffers,
-                     mut len,
-                 }) => {
-                if len == 0 {
-                    *state = None;
-                    return Async::Ready(None);
+                    chunk
                 }
-
-                let sz = cmp::min(len, sz);
-                debug_assert!(sz != 0);
-                let chunk = Self::assemble_chunk(&self.0, &mut buffers, sz);
-
-                len -= sz;
-                *state = if len == 0 {
-                    None
-                } else {
-                    Some(State::Draining { buffers, len })
-                };
-
-                chunk
             }
         };
 
-        Async::Ready(Some(chunk))
+        Ok(Async::Ready(Some(chunk)))
     }
 
-    fn assemble_chunk(chan: &Shared, buffers: &mut VecDeque<Bytes>, mut sz: usize) -> Chunk {
+    fn assemble_chunk(
+        window: &SharedWindow,
+        buffers: &mut VecDeque<Bytes>,
+        mut sz: usize,
+    ) -> Chunk {
         let mut chunk = VecDeque::new();
-
-        // Gather `sz` bytes from `buffers` into the returned `Chunk`.
-        loop {
-            if sz == 0 {
-                return Chunk::from_vec(chan, chunk);
-            }
-
+        while sz != 0 {
             match buffers.pop_front() {
-                None => {
-                    return Chunk::from_vec(chan, chunk);
-                }
-
+                None => break,
                 Some(mut bytes) => {
-                    // If the buffer is larger than the needed number of bytes, save the
-                    // beginning to be returned and put the rest of it back in the buffers
-                    // queue.  If the entire buffer has been requested, just add it to be
-                    // returned.
                     if sz < bytes.len() {
+                        // If the buffer is larger than the needed number of bytes, save the
+                        // beginning to be returned and put the rest of it back in the buffers
+                        // queue.
                         let rest = bytes.split_off(sz);
                         buffers.push_front(rest);
                     }
@@ -350,67 +301,65 @@ impl ByteReceiver {
                 }
             }
         }
+        Chunk::from_vec(window, chunk)
     }
 }
 
 #[derive(Debug)]
 pub struct Chunk {
     bytes: ChunkBytes,
-    channel: Weak<Mutex<Option<State>>>,
+    window: WeakWindow,
 }
 
 impl Chunk {
-    fn empty(channel: &Shared) -> Chunk {
-        let channel = Arc::downgrade(channel);
+    fn empty(w: &SharedWindow) -> Chunk {
         Chunk {
-            channel,
             bytes: ChunkBytes::Zero,
+            window: Arc::downgrade(w),
         }
     }
 
-    fn from_bytes(channel: &Shared, bytes: Bytes) -> Chunk {
+    fn from_bytes(w: &SharedWindow, bytes: Bytes) -> Chunk {
         if bytes.is_empty() {
-            Self::empty(channel)
-        } else {
-            let channel = Arc::downgrade(channel);
-            let bytes = ChunkBytes::One(bytes);
-            Chunk { channel, bytes }
+            return Self::empty(w);
+        }
+
+        Chunk {
+            bytes: ChunkBytes::One(bytes),
+            window: Arc::downgrade(w),
         }
     }
 
-    fn from_vec(channel: &Shared, mut buffers: VecDeque<Bytes>) -> Chunk {
-        match buffers.len() {
-            0 => {
-                return Self::empty(channel);
-            }
-            1 => {
-                return Self::from_bytes(channel, buffers.pop_front().unwrap());
-            }
-            _ => {
-                let remaining = buffers.iter().fold(0, |sz, b| sz + b.len());
-                if remaining == 0 {
-                    return Self::empty(channel);
-                }
+    fn from_vec(w: &SharedWindow, mut buffers: VecDeque<Bytes>) -> Chunk {
+        let sz = buffers.len();
+        if sz == 0 {
+            return Self::empty(w);
+        } else if sz == 1 {
+            return Self::from_bytes(w, buffers.pop_front().unwrap());
+        }
 
-                let channel = Arc::downgrade(channel);
-                Chunk {
-                    channel,
-                    bytes: ChunkBytes::Many { remaining, buffers },
-                }
-            }
+        let remaining = buffers.iter().fold(0, |sz, b| sz + b.len());
+        if remaining == 0 {
+            return Self::empty(w);
+        }
+
+        Chunk {
+            bytes: ChunkBytes::Many { remaining, buffers },
+            window: Arc::downgrade(w),
         }
     }
 
     /// XXX this is probably a bit too heavyweight to do on every Buf::advance()?
-    fn add_capacity(ch: &Weak<Mutex<Option<State>>>, sz: usize) {
-        if let Some(ch) = ch.upgrade() {
-            if let Some(ch) = ch.lock().expect("locking channel").as_mut() {
-                ch.add_capacity(sz);
+    fn add_capacity(wref: &Weak<Mutex<Option<Window>>>, sz: usize) {
+        if let Some(wmut) = wref.upgrade() {
+            if let Some(window) = wmut.lock().expect("locking window").as_mut() {
+                window.push_increment(sz);
             }
         }
     }
 }
 
+// TODO this should be a Rope.
 #[derive(Debug)]
 enum ChunkBytes {
     Zero,
@@ -426,10 +375,10 @@ impl Drop for Chunk {
         match self.bytes {
             ChunkBytes::Zero => {}
             ChunkBytes::One(ref bytes) => {
-                Self::add_capacity(&self.channel, bytes.len());
+                Self::add_capacity(&self.window, bytes.len());
             }
             ChunkBytes::Many { ref remaining, .. } => {
-                Self::add_capacity(&self.channel, *remaining);
+                Self::add_capacity(&self.window, *remaining);
             }
         }
         self.bytes = ChunkBytes::Zero;
@@ -476,7 +425,7 @@ impl Buf for Chunk {
                 } else {
                     drop(bytes.split_to(sz))
                 };
-                Self::add_capacity(&self.channel, sz);
+                Self::add_capacity(&self.window, sz);
                 return;
             }
 
@@ -499,7 +448,7 @@ impl Buf for Chunk {
                         buffers.push_front(rest);
 
                         *remaining -= orig_sz;
-                        Self::add_capacity(&self.channel, orig_sz);
+                        Self::add_capacity(&self.window, orig_sz);
                         return;
                     }
 
@@ -508,7 +457,7 @@ impl Buf for Chunk {
                     sz -= len;
                     if sz == 0 {
                         *remaining -= orig_sz;
-                        Self::add_capacity(&self.channel, orig_sz);
+                        Self::add_capacity(&self.window, orig_sz);
                         return;
                     }
                 }
@@ -516,5 +465,44 @@ impl Buf for Chunk {
         }
 
         panic!("advance exceeds chunk size");
+    }
+}
+
+
+#[derive(Debug)]
+pub struct WindowIncrements(Arc<Mutex<Option<Window>>>);
+
+impl WindowIncrements {
+    fn is_orphaned(&self) -> bool {
+        Arc::strong_count(&self.0) == 1 && Arc::weak_count(&self.0) == 0
+    }
+}
+
+impl Stream for WindowIncrements {
+    type Item = usize;
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<Option<usize>, ()> {
+        let mut window = self.0.lock().expect("locking byte channel");
+
+        if let Some(ref mut w) = *window {
+            // If the window isn't closed, return either a new increment or indicate that
+            // an increment isn't ready.  When poll_increment is not ready, it saves the task to be notified by a channel
+            match w.poll_increment()? {
+                Async::Ready(incr) => {
+                    return Ok(Async::Ready(Some(incr)));
+                }
+
+                Async::NotReady => {
+                    if !self.is_orphaned() {
+                        return Ok(Async::NotReady);
+                    }
+                }
+            }
+        }
+
+        // The window is no
+        *window = None;
+        Ok(Async::Ready(None))
     }
 }
