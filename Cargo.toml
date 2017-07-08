@@ -8,3 +8,6 @@ description = "Future-aware byte streams"
 [dependencies]
 bytes = "0.4"
 futures = "0.1"
+
+[dev-dependencies]
+test_futures = "0.0.1"

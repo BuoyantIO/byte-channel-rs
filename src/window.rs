@@ -123,10 +123,10 @@ impl Window {
 #[cfg(test)]
 mod test {
     use super::*;
-    use super::super::test::*;
     use futures::{Async, Poll, Stream};
     use std::cell::RefCell;
     use std::rc::Rc;
+    use test_futures::*;
 
     // TODO test that the task is notified on state change.
 

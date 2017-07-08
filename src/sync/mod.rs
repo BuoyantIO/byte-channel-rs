@@ -16,14 +16,14 @@ pub use self::window::WindowAdvertiser;
 /// Creates an asynchronous channel for transfering a stream of immutable `Bytes`.
 ///
 /// A sender must be aware of the receiver's available window size and take care not to
-pub fn new<E>(initial_window_size: usize) -> (ByteSender<E>, WindowAdvertiser, ByteReceiver<E>) {
+pub fn new<E>(initial_window_size: usize) -> (WindowAdvertiser, ByteSender<E>, ByteReceiver<E>) {
     let buffer = Arc::new(Mutex::new(Some(ChannelBuffer::default())));
     let window = Arc::new(Mutex::new(Window::new(initial_window_size)));
 
+    let wx = window::new(window.clone());
     let tx = sender::new(buffer.clone(), window.clone());
-    let up = window::new(window.clone());
     let rx = receiver::new(buffer, window);
-    (tx, up, rx)
+    (wx, tx, rx)
 }
 
 type SharedBuffer<E> = Arc<Mutex<Option<ChannelBuffer<E>>>>;
