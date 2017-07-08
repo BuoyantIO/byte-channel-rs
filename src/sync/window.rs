@@ -12,6 +12,8 @@ pub struct WindowAdvertiser(SharedWindow);
 
 impl WindowAdvertiser {
     fn is_orphaned(&self) -> bool {
+        // `BytesSender` and `BytesReceiver` retain strong references to the window.
+        // `Chunk` retains a weak reference.
         Arc::strong_count(&self.0) == 1 && Arc::weak_count(&self.0) == 0
     }
 }

@@ -1,6 +1,9 @@
 use bytes::Bytes;
 
-use super::{ChannelBuffer, SharedBuffer, SharedWindow, LostPeer, ensure_peer};
+use super::{ChannelBuffer, SharedBuffer, SharedWindow, return_buffer_to_window};
+
+#[derive(Copy, Clone, Debug)]
+pub struct LostReceiver;
 
 pub fn new<E>(buffer: SharedBuffer<E>, window: SharedWindow) -> ByteSender<E> {
     ByteSender { buffer, window }
@@ -34,22 +37,11 @@ impl<E> ByteSender<E> {
             .unwrap_or(0)
     }
 
-    fn return_buffer_to_window(&self, buffer: &Option<ChannelBuffer<E>>) {
-        let sz = buffer.as_ref().map(|b| b.len()).unwrap_or(0);
-        if sz == 0 {
-            return;
-        }
-        let mut window = self.window.lock().expect("locking byte channel window");
-        if let Some(ref mut w) = *window {
-            w.push_increment(sz);
-        }
-    }
-
     /// Will cause the next receiver operation to fail with the provided error.
     pub fn reset(self, e: E) {
         let mut buffer = self.buffer.lock().expect("locking byte channel buffer");
-        self.return_buffer_to_window(&buffer);
-        *buffer = Some(ChannelBuffer::Failed(e));
+        return_buffer_to_window(&buffer, &self.window);
+        *buffer = Some(ChannelBuffer::SenderFailed(e));
     }
 
     /// Signals that no further data will be provided.  The `ByteReceiver` may continue to
@@ -61,34 +53,27 @@ impl<E> ByteSender<E> {
     fn do_close(&mut self) {
         let mut buffer = self.buffer.lock().expect("locking byte channel buffer");
 
-        // If there's no receiver, clear the internal state.
-        if let Err(LostPeer) = ensure_peer(&self.buffer) {
-            self.return_buffer_to_window(&buffer);
-            *buffer = None;
-            return;
-        }
-
         // If there is another receiver,
-        match (*buffer).take() {
-            None => {}
+        if let Some(state) = (*buffer).take() {
+            match state {
+                ChannelBuffer::Sending {
+                    len,
+                    buffers,
+                    mut awaiting_chunk,
+                    ..
+                } => {
+                    *buffer = Some(ChannelBuffer::SenderClosed { len, buffers });
 
-            Some(ChannelBuffer::Buffering {
-                     len,
-                     buffers,
-                     mut awaiting_chunk,
-                     ..
-                 }) => {
-                *buffer = Some(ChannelBuffer::Draining { len, buffers });
-
-                // If the receiver is waiting for data, notify it so that the channel is
-                // closed.
-                if let Some(t) = awaiting_chunk.take() {
-                    t.notify();
+                    // If the receiver is waiting for data, notify it so that the channel is
+                    // closed.
+                    if let Some(t) = awaiting_chunk.take() {
+                        t.notify();
+                    }
                 }
-            }
 
-            Some(state) => {
-                *buffer = Some(state);
+                state => {
+                    *buffer = Some(state);
+                }
             }
         }
     }
@@ -98,17 +83,17 @@ impl<E> ByteSender<E> {
     /// ## Panics
     ///
     /// If the channel is not
-    pub fn push_bytes(&mut self, bytes: Bytes) -> Result<(), LostPeer> {
+    pub fn push_bytes(&mut self, bytes: Bytes) -> Result<(), LostReceiver> {
         let mut buffer = self.buffer.lock().expect("locking byte channel buffer");
 
-        if let Err(lost) = ensure_peer(&self.buffer) {
+        if let Some(ChannelBuffer::LostReceiver) = *buffer {
             // If there's no receiver, drop the entire buffer and error.
-            self.return_buffer_to_window(&buffer);
+            // The receiver has already returned the buffer to the window.
             *buffer = None;
-            return Err(lost);
+            return Err(LostReceiver);
         }
 
-        if let Some(ChannelBuffer::Buffering {
+        if let Some(ChannelBuffer::Sending {
                         ref mut len,
                         ref mut awaiting_chunk,
                         ref mut buffers,

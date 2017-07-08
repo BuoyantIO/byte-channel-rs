@@ -28,13 +28,13 @@ type SharedBuffer<E> = Arc<Mutex<Option<ChannelBuffer<E>>>>;
 type SharedWindow = Arc<Mutex<Option<Window>>>;
 type WeakWindow = Weak<Mutex<Option<Window>>>;
 
-#[derive(Copy, Clone, Debug)]
-pub struct LostPeer;
-
-/// Clears out the internal state of `sharded` if the peer has been lost.
-fn ensure_peer<T>(shared: &Arc<T>) -> Result<(), LostPeer> {
-    if Arc::strong_count(shared) == 1 {
-        return Err(LostPeer);
+fn return_buffer_to_window<E>(buffer: &Option<ChannelBuffer<E>>, window: &SharedWindow) {
+    let sz = buffer.as_ref().map(|b| b.len()).unwrap_or(0);
+    if sz == 0 {
+        return;
     }
-    Ok(())
+    let mut window = window.lock().expect("locking byte channel window");
+    if let Some(ref mut w) = *window {
+        w.push_increment(sz);
+    }
 }

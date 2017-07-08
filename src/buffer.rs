@@ -7,26 +7,28 @@ use std::collections::VecDeque;
 /// TODO `buffers` should be stored as a Rope, which should also back Chunk.
 #[derive(Debug)]
 pub enum ChannelBuffer<E> {
-    Buffering {
+    Sending {
         len: usize,
         buffers: VecDeque<Bytes>,
         awaiting_chunk: Option<Task>,
     },
 
     /// No more data may be added to the byte channel.
-    Draining {
+    SenderClosed {
         len: usize,
         buffers: VecDeque<Bytes>,
     },
 
     /// Indicates the sender has failed the stream and the next chunk read will fail with
     /// `E`.
-    Failed(E),
+    SenderFailed(E),
+
+    LostReceiver,
 }
 
 impl<E> Default for ChannelBuffer<E> {
     fn default() -> Self {
-        ChannelBuffer::Buffering {
+        ChannelBuffer::Sending {
             len: 0,
             buffers: VecDeque::new(),
             awaiting_chunk: None,
@@ -38,9 +40,9 @@ impl<E> ChannelBuffer<E> {
     pub fn len(&self) -> usize {
         use self::ChannelBuffer::*;
         match *self {
-            Buffering { len, .. } => len,
-            Draining { len, .. } => len,
-            Failed(_) => 0,
+            Sending { len, .. } => len,
+            SenderClosed { len, .. } => len,
+            _ => 0,
         }
     }
 

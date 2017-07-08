@@ -3,7 +3,7 @@ use futures::*;
 use std::collections::VecDeque;
 use std::cmp;
 
-use super::{ChannelBuffer, SharedBuffer, SharedWindow, ensure_peer};
+use super::{ChannelBuffer, SharedBuffer, SharedWindow, return_buffer_to_window};
 use super::chunk::{self, Chunk};
 
 pub type PollChunk<E> = Result<Async<Option<Chunk>>, E>;
@@ -16,6 +16,19 @@ pub fn new<E>(buffer: SharedBuffer<E>, window: SharedWindow) -> ByteReceiver<E> 
 pub struct ByteReceiver<E> {
     buffer: SharedBuffer<E>,
     window: SharedWindow,
+}
+
+impl<E> Drop for ByteReceiver<E> {
+    fn drop(&mut self) {
+        if let Ok(mut buffer) = self.buffer.lock() {
+            let b = (*buffer).take();
+            if b.is_none() {
+                return;
+            }
+            return_buffer_to_window(&buffer, &self.window);
+            *buffer = Some(ChannelBuffer::LostReceiver)
+        }
+    }
 }
 
 impl<E> ByteReceiver<E> {
@@ -32,25 +45,19 @@ impl<E> ByteReceiver<E> {
                     return Ok(Async::Ready(None));
                 }
 
-                Some(ChannelBuffer::Failed(e)) => {
+                Some(ChannelBuffer::LostReceiver) => unreachable!(),
+                Some(ChannelBuffer::SenderFailed(e)) => {
                     return Err(e);
                 }
 
-                Some(ChannelBuffer::Buffering {
+                Some(ChannelBuffer::Sending {
                          mut len,
                          mut buffers,
                          ..
                      }) => {
+                    // If there's no data, wait for some.
                     if len == 0 {
-                        // If the buffer is empty and the sender has detached, there's no
-                        // chance of producing anythign further.
-                        if let Err(_) = ensure_peer(&self.buffer) {
-                            *buffer = None;
-                            return Ok(Async::Ready(None));
-                        }
-
-                        // Otherwise, wiat for another chunk to be pushed.
-                        *buffer = Some(ChannelBuffer::Buffering {
+                        *buffer = Some(ChannelBuffer::Sending {
                             len,
                             buffers,
                             awaiting_chunk: Some(task::current()),
@@ -65,7 +72,7 @@ impl<E> ByteReceiver<E> {
                     len -= sz;
                     let chunk = Self::assemble_chunk(&self.window, &mut buffers, sz);
 
-                    *buffer = Some(ChannelBuffer::Buffering {
+                    *buffer = Some(ChannelBuffer::Sending {
                         len,
                         buffers,
                         awaiting_chunk: None,
@@ -74,7 +81,7 @@ impl<E> ByteReceiver<E> {
                     chunk
                 }
 
-                Some(ChannelBuffer::Draining {
+                Some(ChannelBuffer::SenderClosed {
                          mut buffers,
                          mut len,
                      }) => {
@@ -92,7 +99,7 @@ impl<E> ByteReceiver<E> {
                         if len == 0 {
                             None
                         } else {
-                            Some(ChannelBuffer::Draining { buffers, len })
+                            Some(ChannelBuffer::SenderClosed { buffers, len })
                         }
                     };
 
